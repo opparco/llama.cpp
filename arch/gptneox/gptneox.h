@@ -173,9 +173,13 @@ extern "C" {
                              int   n_max_tokens,
                             bool   add_bos);
 
-    GPTNEOX_API int gptneox_n_vocab(struct gptneox_context * ctx);
-    GPTNEOX_API int gptneox_n_ctx  (struct gptneox_context * ctx);
-    GPTNEOX_API int gptneox_n_embd (struct gptneox_context * ctx);
+    GPTNEOX_API int gptneox_n_vocab(const struct gptneox_context * ctx);
+    GPTNEOX_API int gptneox_n_ctx  (const struct gptneox_context * ctx);
+    GPTNEOX_API int gptneox_n_embd (const struct gptneox_context * ctx);
+
+    GPTNEOX_API int gptneox_n_vocab_from_model(const struct gptneox_model * model);
+    GPTNEOX_API int gptneox_n_ctx_from_model  (const struct gptneox_model * model);
+    GPTNEOX_API int gptneox_n_embd_from_model (const struct gptneox_model * model);
 
     // Token logits obtained from the last call to gptneox_eval()
     // The logits for the last token are stored in the last row
@@ -189,10 +193,10 @@ extern "C" {
     GPTNEOX_API float * gptneox_get_embeddings(struct gptneox_context * ctx);
 
     // Token Id -> String. Uses the vocabulary in the provided context
-    GPTNEOX_API const char * gptneox_token_to_str(struct gptneox_context * ctx, gptneox_token token);
+    GPTNEOX_API const char * gptneox_token_to_str(const struct gptneox_context * ctx, gptneox_token token);
 
     // String -> Token Id. Uses the vocabulary in the provided context
-    GPTNEOX_API gptneox_token gptneox_str_to_token(struct gptneox_context * ctx, const char * str);
+    GPTNEOX_API gptneox_token gptneox_str_to_token(const struct gptneox_context * ctx, const char * str);
 
     // Special tokens
     GPTNEOX_API gptneox_token gptneox_token_bos();

@@ -177,6 +177,19 @@ struct gptneox_kv_cache {
     }
 };
 
+struct gptneox_vocab {
+    using id    = int32_t;
+    using token = std::string;
+
+    struct token_score {
+        token tok;
+        float score;
+    };
+
+    std::unordered_map<token, id> token_to_id;
+    std::vector<token_score> id_to_token;
+};
+
 struct gptneox_model {
     e_model type = MODEL_UNKNOWN;
 
@@ -210,6 +223,11 @@ struct gptneox_model {
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
+    int64_t t_load_us = 0;
+    int64_t t_start_us = 0;
+
+    gptneox_vocab vocab;
+
     ~gptneox_model() {
         if (ctx) {
             ggml_free(ctx);
@@ -217,24 +235,16 @@ struct gptneox_model {
     }
 };
 
-struct gptneox_vocab {
-    using id    = int32_t;
-    using token = std::string;
-
-    struct token_score {
-        token tok;
-        float score;
-    };
-
-    std::unordered_map<token, id> token_to_id;
-    std::vector<token_score> id_to_token;
-};
-
 struct gptneox_context {
+    gptneox_context(const gptneox_model & model) : model(model), t_load_us(model.t_load_us), t_start_us(model.t_start_us) {}
+    ~gptneox_context() {
+        if (model_owner) {
+            delete &model;
+        }
+    }
+
     std::mt19937 rng;
 
-    int64_t t_load_us = 0;
-    int64_t t_start_us = 0;
     bool has_evaluated_once = false;
 
     int64_t t_sample_us = 0;
@@ -245,8 +255,12 @@ struct gptneox_context {
     int32_t n_eval   = 0; // number of eval calls
     int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
 
-    gptneox_model model;
-    gptneox_vocab vocab;
+    const gptneox_model & model;
+
+    bool model_owner = false;
+
+    int64_t t_load_us = 0;
+    int64_t t_start_us = 0;
 
     // key + value cache for the self attention
     struct gptneox_kv_cache kv_self;
@@ -907,7 +921,9 @@ static const char *gptneox_model_type_name(e_model type) {
 
 static void gptneox_model_load_internal(
         const std::string & fname,
-        gptneox_context & lctx,
+        //OBSOLETE: gptneox_context & lctx,
+        gptneox_model & model,
+        gptneox_vocab & vocab,
         int n_ctx,
         ggml_type memory_type,
         bool use_mmap,
@@ -916,14 +932,15 @@ static void gptneox_model_load_internal(
         gptneox_progress_callback progress_callback,
         void * progress_callback_user_data) {
 
-    lctx.t_start_us = ggml_time_us();
+    model.t_start_us = ggml_time_us();
 
     std::unique_ptr<gptneox_model_loader> ml(new gptneox_model_loader(fname, use_mmap));
 
-    lctx.vocab = std::move(ml->file_loaders.at(0)->vocab);
-    auto & model = lctx.model;
+    vocab = std::move(ml->file_loaders.at(0)->vocab);
     model.hparams = ml->file_loaders.at(0)->hparams;
+
     arch_util_file_version file_version = ml->file_loaders.at(0)->file_version;
+
     auto & hparams = model.hparams;
     
     {
@@ -993,15 +1010,15 @@ static void gptneox_model_load_internal(
 
     // create the ggml context
     {
-        lctx.model.buf.resize(ctx_size);
+        model.buf.resize(ctx_size);
         if (use_mlock) {
-            lctx.model.mlock_buf.init(lctx.model.buf.addr);
-            lctx.model.mlock_buf.grow_to(lctx.model.buf.size);
+            model.mlock_buf.init(model.buf.addr);
+            model.mlock_buf.grow_to(model.buf.size);
         }
 
         struct ggml_init_params params = {
-            /*.mem_size   =*/ lctx.model.buf.size,
-            /*.mem_buffer =*/ lctx.model.buf.addr,
+            /*.mem_size   =*/ model.buf.size,
+            /*.mem_buffer =*/ model.buf.addr,
             /*.no_alloc   =*/ ml->use_mmap,
         };
 
@@ -1057,18 +1074,20 @@ static void gptneox_model_load_internal(
         model.tensors_by_name.emplace_back(lt.name, lt.ggml_tensor);
     }
 
-    ml->load_all_data(progress_callback, progress_callback_user_data, use_mlock ? &lctx.model.mlock_mmap : NULL);
+    ml->load_all_data(progress_callback, progress_callback_user_data, use_mlock ? &model.mlock_mmap : NULL);
 
     model.mapping = std::move(ml->mapping);
 
     // loading time will be recalculate after the first eval, so
     // we take page faults deferred by mmap() into consideration
-    lctx.t_load_us = ggml_time_us() - lctx.t_start_us;
+    model.t_load_us = ggml_time_us() - model.t_start_us;
 }
 
 static bool gptneox_model_load(
         const std::string & fname,
-        gptneox_context & lctx,
+        //OBSOLETE: gptneox_context & lctx,
+        gptneox_model & model,
+        gptneox_vocab & vocab,
         int n_ctx,
         ggml_type memory_type,
         bool use_mmap,
@@ -1077,7 +1096,7 @@ static bool gptneox_model_load(
         gptneox_progress_callback progress_callback,
         void *progress_callback_user_data) {
     try {
-        gptneox_model_load_internal(fname, lctx, n_ctx, memory_type, use_mmap, use_mlock,
+        gptneox_model_load_internal(fname, model, vocab, n_ctx, memory_type, use_mmap, use_mlock,
                                   vocab_only, progress_callback, progress_callback_user_data);
         return true;
     } catch (const std::string & err) {
@@ -1158,7 +1177,7 @@ static struct ggml_cgraph * gptneox_build_graph(
     }
 
     for (int i = 0; i < n_layer; ++i) {
-        struct gptneox_layer & layer = model.layers[i];
+        auto & layer = model.layers[i];
         
         lctx.use_buf(ctx0, 0);
 
@@ -2071,12 +2090,39 @@ gptneox_token gptneox_sample_token(struct gptneox_context * ctx, gptneox_token_d
 // interface implementation
 //
 
-struct gptneox_context * gptneox_init_from_file(
+struct gptneox_model * gptneox_load_model_from_file(
                              const char * path_model,
             struct gptneox_context_params   params) {
     ggml_time_init();
 
-    gptneox_context * ctx = new gptneox_context;
+    gptneox_model * model = new gptneox_model;
+
+    ggml_type memory_type = params.f16_kv ? GGML_TYPE_F16 : GGML_TYPE_F32;
+
+    if (!gptneox_model_load(path_model, *model, model->vocab, params.n_ctx, memory_type,
+                          params.use_mmap, params.use_mlock, params.vocab_only,
+                          params.progress_callback, params.progress_callback_user_data)) {
+        fprintf(stderr, "%s: failed to load model\n", __func__);
+        delete model;
+        return nullptr;
+    }
+
+    return model;
+}
+
+void gptneox_free_model(struct gptneox_model * model) {
+    delete model;
+}
+
+struct gptneox_context * gptneox_new_context_with_model(
+                 struct gptneox_model * model,
+        struct gptneox_context_params   params) {
+
+    if (!model) {
+        return nullptr;
+    }
+
+    gptneox_context * ctx = new gptneox_context(*model);
 
     if (params.seed <= 0) {
         params.seed = time(NULL);
@@ -2102,14 +2148,6 @@ struct gptneox_context * gptneox_init_from_file(
     ctx->logits_all = params.logits_all;
 
     ggml_type memory_type = params.f16_kv ? GGML_TYPE_F16 : GGML_TYPE_F32;
-
-    if (!gptneox_model_load(path_model, *ctx, params.n_ctx, memory_type,
-                          params.use_mmap, params.use_mlock, params.vocab_only,
-                          params.progress_callback, params.progress_callback_user_data)) {
-        fprintf(stderr, "%s: failed to load model\n", __func__);
-        gptneox_free(ctx);
-        return nullptr;
-    }
 
     // reserve memory for context buffers
     if (!params.vocab_only) {
@@ -2145,6 +2183,19 @@ struct gptneox_context * gptneox_init_from_file(
 #endif
     }
 
+    return ctx;
+}
+
+struct gptneox_context * gptneox_init_from_file(
+                             const char * path_model,
+            struct gptneox_context_params   params) {
+
+    struct gptneox_model * model = gptneox_load_model_from_file(path_model, params);
+    if (!model) {
+        return nullptr;
+    }
+    struct gptneox_context * ctx = gptneox_new_context_with_model(model, params);
+    ctx->model_owner = true;
     return ctx;
 }
 
@@ -2650,7 +2701,7 @@ int gptneox_tokenize(
                  gptneox_token * tokens,
                          int   n_max_tokens,
                         bool   add_bos) {
-    auto res = gptneox_tokenize(ctx->vocab, text, add_bos);
+    auto res = gptneox_tokenize(ctx->model.vocab, text, add_bos);
 
     if (n_max_tokens < (int) res.size()) {
         fprintf(stderr, "%s: too many tokens\n", __func__);
@@ -2664,15 +2715,27 @@ int gptneox_tokenize(
     return res.size();
 }
 
-int gptneox_n_vocab(struct gptneox_context * ctx) {
-    return ctx->vocab.id_to_token.size();
+int gptneox_n_vocab_from_model(const struct gptneox_model * model) {
+    return model->vocab.id_to_token.size();
 }
 
-int gptneox_n_ctx(struct gptneox_context * ctx) {
+int gptneox_n_ctx_from_model(const struct gptneox_model * model) {
+    return model->hparams.n_ctx;
+}
+
+int gptneox_n_embd_from_model(const struct gptneox_model * model) {
+    return model->hparams.n_embd;
+}
+
+int gptneox_n_vocab(const struct gptneox_context * ctx) {
+    return ctx->model.vocab.id_to_token.size();
+}
+
+int gptneox_n_ctx(const struct gptneox_context * ctx) {
     return ctx->model.hparams.n_ctx;
 }
 
-int gptneox_n_embd(struct gptneox_context * ctx) {
+int gptneox_n_embd(const struct gptneox_context * ctx) {
     return ctx->model.hparams.n_embd;
 }
 
@@ -2684,16 +2747,28 @@ float * gptneox_get_embeddings(struct gptneox_context * ctx) {
     return ctx->embedding.data();
 }
 
-const char * gptneox_token_to_str(struct gptneox_context * ctx, gptneox_token token) {
-    if (token >= gptneox_n_vocab(ctx)) {
+const char * gptneox_token_to_str_with_model(const struct gptneox_model * model, gptneox_token token) {
+    if (token >= gptneox_n_vocab_from_model(model)) {
         return nullptr;
     }
 
-    return ctx->vocab.id_to_token[token].tok.c_str();
+    return model->vocab.id_to_token[token].tok.c_str();
 }
 
-gptneox_token gptneox_str_to_token(struct gptneox_context * ctx, const char * str) {
-    return ctx->vocab.token_to_id[str];
+const char * gptneox_token_to_str(const struct gptneox_context * ctx, gptneox_token token) {
+    return gptneox_token_to_str_with_model(&ctx->model, token);
+}
+
+gptneox_token gptneox_str_to_token_with_model(const struct gptneox_model * model, const char * str) {
+    auto token_iter = model->vocab.token_to_id.find(str);
+    if (token_iter == model->vocab.token_to_id.end()) {
+        return 0;
+    }
+    return token_iter->second;
+}
+
+gptneox_token gptneox_str_to_token(const struct gptneox_context * ctx, const char * str) {
+    return gptneox_str_to_token_with_model(&ctx->model, str);
 }
 
 gptneox_token gptneox_token_bos() {
@@ -2750,7 +2825,7 @@ const char * gptneox_print_system_info(void) {
 }
 
 // For internal test use
-std::vector<std::pair<std::string, struct ggml_tensor *>>& gptneox_internal_get_tensor_map(struct gptneox_context * ctx) {
+const std::vector<std::pair<std::string, struct ggml_tensor *>>& gptneox_internal_get_tensor_map(struct gptneox_context * ctx) {
     return ctx->model.tensors_by_name;
 }
 
