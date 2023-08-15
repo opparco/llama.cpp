@@ -4,8 +4,7 @@
 
 static void gptneox_model_update_internal(const std::string & fname_inp, const std::string & fname_out) {
     std::unique_ptr<gptneox_model_loader> model_loader(new gptneox_model_loader(fname_inp.c_str(),
-                                                            /*use_mmap*/ false,
-                                                            /*vocab_only*/ false));
+                                                            /*use_mmap*/ false));
     // Simply use the ftype of the first file
     auto ftype = model_loader->file_loaders[0]->hparams.ftype;
     arch_util_file_saver file_saver(fname_out.c_str(), model_loader->file_loaders.at(0).get(), ftype);

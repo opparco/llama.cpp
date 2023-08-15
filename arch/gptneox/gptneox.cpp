@@ -44,22 +44,37 @@ enum e_model {
     MODEL_20B,
 };
 
-static const size_t MiB = 1024*1024;
+static const size_t MB = 1024*1024;
 
 // computed for n_ctx == 2048
 // TODO: dynamically determine these sizes
 // TODO: To load the stablelm 3B model on my test XR will require some tricks, small ggml context size, mmap support, among others, but is maybe feasible, is a smaller n_ctx required? 512 instead of 2048/4096? Does mmap work as desired on iOS?
 //       needs modifications in ggml
 
+//
+// ggml helpers
+//
+
+static void ggml_graph_compute_helper(std::vector<uint8_t> & buf, ggml_cgraph * graph, int n_threads) {
+    struct ggml_cplan plan = ggml_graph_plan(graph, n_threads);
+
+    if (plan.work_size > 0) {
+        buf.resize(plan.work_size);
+        plan.work_data = buf.data();
+    }
+
+    ggml_graph_compute(graph, &plan);
+}
+
 // TODO: Modify for gptneox, how are these values actually determined?
 // TODO: This is now priority, 
 static const std::map<e_model, size_t> & MEM_REQ_SCRATCH0()
 {
     static std::map<e_model, size_t> _MEM_REQ_SCRATCH0 = {
-        { MODEL_3B,    256ull * MiB },
-        { MODEL_7B,    512ull * MiB },
-        { MODEL_12B,   512ull * MiB },
-        { MODEL_20B,   512ull * MiB },
+        { MODEL_3B,    256ull * MB },
+        { MODEL_7B,    512ull * MB },
+        { MODEL_12B,   512ull * MB },
+        { MODEL_20B,   512ull * MB },
     };
     return _MEM_REQ_SCRATCH0;
 }
@@ -68,10 +83,10 @@ static const std::map<e_model, size_t> & MEM_REQ_SCRATCH0()
 static const std::map<e_model, size_t> & MEM_REQ_SCRATCH1()
 {
     static std::map<e_model, size_t> _MEM_REQ_SCRATCH1 = {
-        { MODEL_3B,    256ull * MiB },
-        { MODEL_7B,    512ull * MiB },
-        { MODEL_12B,   512ull * MiB },
-        { MODEL_20B,   512ull * MiB },
+        { MODEL_3B,    256ull * MB },
+        { MODEL_7B,    512ull * MB },
+        { MODEL_12B,   512ull * MB },
+        { MODEL_20B,   512ull * MB },
     };
     return _MEM_REQ_SCRATCH1;
 }
@@ -82,10 +97,10 @@ static const std::map<e_model, size_t> & MEM_REQ_SCRATCH1()
 static const std::map<e_model, size_t> & MEM_REQ_KV_SELF()
 {
     static std::map<e_model, size_t> _MEM_REQ_KV_SELF = {
-        { MODEL_3B,   512ull * MiB },
-        { MODEL_7B,   1026ull * MiB },
-        { MODEL_12B,  1608ull * MiB },
-        { MODEL_20B,  1608ull * MiB },
+        { MODEL_3B,   512ull * MB },
+        { MODEL_7B,   1026ull * MB },
+        { MODEL_12B,  1608ull * MB },
+        { MODEL_20B,  1608ull * MB },
     };
     return _MEM_REQ_KV_SELF;
 }
@@ -96,10 +111,10 @@ static const std::map<e_model, size_t> & MEM_REQ_KV_SELF()
 static const std::map<e_model, size_t> & MEM_REQ_EVAL()
 {
     static std::map<e_model, size_t> _MEM_REQ_EVAL = {
-        { MODEL_3B,   512ull * MiB },
-        { MODEL_7B,   768ull * MiB },
-        { MODEL_12B, 1024ull * MiB },
-        { MODEL_20B, 1024ull * MiB },
+        { MODEL_3B,   512ull * MB },
+        { MODEL_7B,   768ull * MB },
+        { MODEL_12B, 1024ull * MB },
+        { MODEL_20B, 1024ull * MB },
     };
     return _MEM_REQ_EVAL;
 }
@@ -182,10 +197,6 @@ struct gptneox_model {
     // context
     struct ggml_context * ctx = NULL;
 
-    // key + value cache for the self attention
-    // TODO: move to gptneox_state
-    struct gptneox_kv_cache kv_self;
-
     // the model memory buffer
     arch_util_buffer buf;
 
@@ -237,6 +248,9 @@ struct gptneox_context {
     gptneox_model model;
     gptneox_vocab vocab;
 
+    // key + value cache for the self attention
+    struct gptneox_kv_cache kv_self;
+
     size_t mem_per_token = 0;
 
     // decode output (2-dimensional array: [n_tokens][n_vocab])
@@ -245,6 +259,9 @@ struct gptneox_context {
 
     // input embedding (1-dimensional array: [n_embd])
     std::vector<float> embedding;
+
+    // reusable buffer for `struct ggml_graph_plan.work_data`
+    std::vector<uint8_t> work_buffer;
 
     // memory buffers used to evaluate the model
     // TODO: move in gptneox_state
@@ -514,7 +531,7 @@ struct arch_util_file_loader {
 
             if (file_version >= GPTNEOX_FILE_VERSION_GGJT_V1) {
                 // skip to the next multiple of 32 bytes
-                file.seek(-file.tell() & 31, SEEK_CUR);
+                file.seek(-static_cast<ptrdiff_t>(file.tell()) & 31, SEEK_CUR);
             }
             shard.file_idx = file_idx;
             shard.file_off = file.tell();
@@ -590,7 +607,7 @@ struct arch_util_file_saver {
         file.write_u32(new_type);
         file.write_raw(tensor.ne.data(), sizeof(tensor.ne[0]) * tensor.ne.size());
         file.write_raw(tensor.name.data(), tensor.name.size());
-        file.seek(-file.tell() & 31, SEEK_CUR);
+        file.seek(-static_cast<ptrdiff_t>(file.tell()) & 31, SEEK_CUR);
         ARCH_ASSERT(new_size == gptneox_calc_tensor_size(tensor.ne, new_type));
         file.write_raw(new_data, new_size);
     }
@@ -604,7 +621,7 @@ struct gptneox_model_loader {
     struct ggml_context * ggml_ctx = NULL;
     std::unique_ptr<arch_util_mmap> mapping;
 
-    gptneox_model_loader(const std::string & fname_base, bool use_mmap, bool vocab_only) {
+    gptneox_model_loader(const std::string & fname_base, bool use_mmap) {
         auto first_file = new arch_util_file_loader(fname_base.c_str(), 0, tensors_map);
         file_loaders.emplace_back(first_file);
         uint32_t n_parts = 1;
@@ -659,10 +676,12 @@ struct gptneox_model_loader {
                          name.c_str(), gptneox_format_tensor_shape(ne).c_str(), gptneox_format_tensor_shape(lt.ne).c_str());
         }
         
+#if 0
         printf("%48s - %14s, type = %4s\n",
                lt.name.c_str(),
                gptneox_format_tensor_shape(lt.ne).c_str(),
                ggml_type_name(lt.type));
+#endif
 
         return get_tensor_for(lt);
     }
@@ -799,7 +818,7 @@ static bool kv_cache_init(
     const int64_t n_mem      = (int64_t)n_layer*n_ctx;
     const int64_t n_elements = n_embd*n_mem;
 
-    cache.buf.resize(2u*n_elements*ggml_type_size(wtype) + 2u*MiB);
+    cache.buf.resize(2u*n_elements*ggml_type_size(wtype) + 2u*MB);
 
     struct ggml_init_params params;
     params.mem_size   = cache.buf.size;
@@ -824,7 +843,7 @@ struct gptneox_context_params gptneox_context_default_params() {
         /*.seed                        =*/ DEFAULT_SEED,
         /*.n_ctx                       =*/ 512,
         /*.n_batch                     =*/ 512,
-        /*.f16_kv                      =*/ false,
+        /*.f16_kv                      =*/ true,
         /*.logits_all                  =*/ false,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
@@ -899,7 +918,7 @@ static void gptneox_model_load_internal(
 
     lctx.t_start_us = ggml_time_us();
 
-    std::unique_ptr<gptneox_model_loader> ml(new gptneox_model_loader(fname, use_mmap, vocab_only));
+    std::unique_ptr<gptneox_model_loader> ml(new gptneox_model_loader(fname, use_mmap));
 
     lctx.vocab = std::move(ml->file_loaders.at(0)->vocab);
     auto & model = lctx.model;
@@ -915,6 +934,10 @@ static void gptneox_model_load_internal(
                 } else {
                     model.type = e_model::MODEL_7B;
                 }
+                break;
+            }
+            case 32: {
+                model.type = e_model::MODEL_7B;
                 break;
             }
             case 36: model.type = e_model::MODEL_12B; break;
@@ -964,7 +987,7 @@ static void gptneox_model_load_internal(
         const size_t mem_required_state =
             scale*MEM_REQ_KV_SELF().at(model.type);
 
-        fprintf(stderr, "%s: mem required  = %7.2f MiB (+ %7.2f MiB per state)\n", __func__,
+        fprintf(stderr, "%s: mem required  = %7.2f MB (+ %7.2f MB per state)\n", __func__,
                 mem_required / 1024.0 / 1024.0, mem_required_state / 1024.0 / 1024.0);
     }
 
@@ -1076,27 +1099,21 @@ static inline struct ggml_tensor * layer_norm(ggml_context * ctx, struct ggml_te
             ggml_repeat(ctx, bias, cur));
 }
 
-// evaluate the transformer
-//
-//   - lctx:      llama context
-//   - tokens:    new batch of tokens to process
-//   - n_past:    the context size so far
-//   - n_threads: number of threads to use
-//
-static bool gptneox_eval_internal(
-        gptneox_context & lctx,
-    const gptneox_token * tokens,
-            const int   n_tokens,
-            const int   n_past,
-            const int   n_threads) {
-    const int64_t t_start_us = ggml_time_us();
+static struct ggml_cgraph * gptneox_build_graph(
+         gptneox_context & lctx,
+     const gptneox_token * tokens,
+           const float * embd,
+                   int   n_tokens,
+                   int   n_past) {
+
+    ARCH_ASSERT((!tokens && embd) || (tokens && !embd));
 
     const int N = n_tokens;
 
     auto & model   = lctx.model;
     const auto & hparams = model.hparams;
 
-    auto & kv_self = model.kv_self;
+    auto & kv_self = lctx.kv_self;
 
     ARCH_ASSERT(!!kv_self.ctx);
 
@@ -1117,25 +1134,36 @@ static bool gptneox_eval_internal(
         /*.no_alloc   =*/ false,
     };
 
-    struct ggml_context * ctx = ggml_init(params);
+    struct ggml_context * ctx0 = ggml_init(params);
 
-    // for big prompts, if BLAS is enabled, it is better to use only one thread
-    // otherwise, the threads are spin-lock waiting for the BLAS calls and are degrading the performance
-    ggml_cgraph gf = {};
-    gf.n_threads = N >= 32 && ggml_cpu_has_blas() && !ggml_cpu_has_cublas() ? 1 : n_threads;
+    ggml_cgraph * gf = ggml_new_graph(ctx0);
 
-    struct ggml_tensor * embd = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
-    memcpy(embd->data, tokens, N*ggml_element_size(embd));
+    struct ggml_tensor * inpL;
 
-    struct ggml_tensor * inpL = ggml_get_rows(ctx, model.wte, embd);
+    if (tokens) {
+        struct ggml_tensor * inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, N);
+
+        memcpy(inp_tokens->data, tokens, N * ggml_element_size(inp_tokens));
+        ggml_set_name(inp_tokens, "inp_tokens");
+
+        inpL = ggml_get_rows(ctx0, model.wte, inp_tokens);
+    } else {
+#ifdef GGML_USE_MPI
+        GGML_ASSERT(false && "not implemented");
+#endif
+
+        inpL = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_embd, N);
+
+        memcpy(inpL->data, embd, N * n_embd * ggml_element_size(inpL));
+    }
 
     for (int i = 0; i < n_layer; ++i) {
         struct gptneox_layer & layer = model.layers[i];
         
-        lctx.use_buf(ctx, 0);
+        lctx.use_buf(ctx0, 0);
 
         // input norm
-        struct ggml_tensor * cur = layer_norm(ctx, inpL, layer.ln_attn_g, layer.ln_attn_b);
+        struct ggml_tensor * cur = layer_norm(ctx0, inpL, layer.ln_attn_g, layer.ln_attn_b);
 
         // self-attention
         {
@@ -1148,28 +1176,28 @@ static bool gptneox_eval_internal(
             // cur = attn_w*cur + attn_b
             // [3*n_embd, N]
             {
-                cur = ggml_mul_mat(ctx, layer.c_attn_attn_w, cur);
-                cur = ggml_add_inplace(ctx,
+                cur = ggml_mul_mat(ctx0, layer.c_attn_attn_w, cur);
+                cur = ggml_add_inplace(ctx0,
                         cur,
-                        ggml_repeat(ctx, layer.c_attn_attn_b, cur));
+                        ggml_repeat(ctx0, layer.c_attn_attn_b, cur));
             }
              
             // Split QKV and make contiguous
-            struct ggml_tensor * Qcur = ggml_view_3d(ctx, cur,
+            struct ggml_tensor * Qcur = ggml_view_3d(ctx0, cur,
                                             head_dim,
                                             n_head,
                                             N,
                                             ggml_element_size(cur) * 3 * head_dim,
                                             ggml_element_size(cur) * 3 * n_embd,
                                             ggml_element_size(cur) * head_dim * 0);
-            struct ggml_tensor * Kcur = ggml_view_3d(ctx, cur,
+            struct ggml_tensor * Kcur = ggml_view_3d(ctx0, cur,
                                             head_dim,
                                             n_head,
                                             N,
                                             ggml_element_size(cur) * 3 * head_dim,
                                             ggml_element_size(cur) * 3 * n_embd,
                                             ggml_element_size(cur) * head_dim * 1);
-            struct ggml_tensor * Vcur = ggml_view_3d(ctx, cur,
+            struct ggml_tensor * Vcur = ggml_view_3d(ctx0, cur,
                                             head_dim,
                                             n_head,
                                             N,
@@ -1177,12 +1205,12 @@ static bool gptneox_eval_internal(
                                             ggml_element_size(cur) * 3 * n_embd,
                                             ggml_element_size(cur) * head_dim * 2);
             // TODO: Flatten without copying, or see if non-contiguous can be used for any of QKV.
-            Qcur = ggml_cpy(ctx, Qcur,
-                        ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head, N));
-            Kcur = ggml_cpy(ctx, Kcur,
-                        ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head, N));
-            Vcur = ggml_cpy(ctx, Vcur,
-                        ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head, N));
+            Qcur = ggml_cpy(ctx0, Qcur,
+                        ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, head_dim, n_head, N));
+            Kcur = ggml_cpy(ctx0, Kcur,
+                        ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, head_dim, n_head, N));
+            Vcur = ggml_cpy(ctx0, Vcur,
+                        ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, head_dim, n_head, N));
             
             // MARK: gptneox RoPE Q and K, before cache
             // Bit 2 for gptneox style (2)
@@ -1193,54 +1221,54 @@ static bool gptneox_eval_internal(
             // store key and value to memory, not required if prompt if only a single token (not practical or likely)
             //if (N >= 1) {
                 // Each entry in kv_self has byte size of (ggml_element_size * n_embd * n_ctx * n_layer)
-                Vcur = ggml_view_2d(ctx, Vcur,
+                Vcur = ggml_view_2d(ctx0, Vcur,
                             n_embd,
                             N,
                             ggml_element_size(Vcur) * n_embd,
                             0);
-                Vcur = ggml_transpose(ctx, Vcur);
+                Vcur = ggml_transpose(ctx0, Vcur);
             
-                struct ggml_tensor * k = ggml_view_1d(ctx, kv_self.k,
+                struct ggml_tensor * k = ggml_view_1d(ctx0, kv_self.k,
                                             n_embd * N, // num elements in current context (up to n_embd*n_ctx but usually less)
                                             ggml_element_size(kv_self.k) * n_embd * (i * n_ctx + n_past));
-                struct ggml_tensor * v = ggml_view_2d(ctx, kv_self.v,
+                struct ggml_tensor * v = ggml_view_2d(ctx0, kv_self.v,
                                             N,
                                             n_embd,
                                             ggml_element_size(kv_self.v) * n_ctx,
                                             ggml_element_size(kv_self.v) * ((i * n_ctx * n_embd) + n_past));
             
                 // important: storing RoPE-ed version of K in the KV cache!
-                ggml_build_forward_expand(&gf, ggml_cpy(ctx, Kcur, k));
-                ggml_build_forward_expand(&gf, ggml_cpy(ctx, Vcur, v));
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, k));
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, v));
             //}
             
             // Test RoPE after kv cache
             // for when we want to keep as much of the context as possible, we do not want to recalc kv weights
             // but positional encoding will change when old tokens are removed
             // Q is not cached so it is simply the same as the before version
-            Qcur = ggml_rope_inplace(ctx, Qcur, n_past, n_rot, 2, 0);
+            Qcur = ggml_rope_inplace(ctx0, Qcur, n_past, n_rot, 2, 0);
             // RoPE all in k cache
             // TODO: Should be able to replace view 1d and reshape 3d with a single view 3d
             // Do we need a larger scratch for this temp duplication?
-            struct ggml_tensor * Kall = ggml_dup(ctx,
-                                            ggml_reshape_3d(ctx,
-                                                ggml_view_1d(ctx, kv_self.k,
+            struct ggml_tensor * Kall = ggml_dup(ctx0,
+                                            ggml_reshape_3d(ctx0,
+                                                ggml_view_1d(ctx0, kv_self.k,
                                                     (n_past + N) * n_embd,
                                                     ggml_element_size(kv_self.k) * i * n_ctx * n_embd),
                                                 head_dim, n_head, n_past + N));
-            Kall = ggml_rope_inplace(ctx, Kall, 0 /*n_past*/, n_rot, 2, 0); //3);
+            Kall = ggml_rope_inplace(ctx0, Kall, 0 /*n_past*/, n_rot, 2, 0); //3);
             
             // Q = Qcur.contiguous().view(head_dim, n_head, N).permute(0, 2, 1, 3)
             struct ggml_tensor * Q =
-                ggml_permute(ctx,
+                ggml_permute(ctx0,
                         Qcur,
                         0, 2, 1, 3);
 
             // K = Kmem.view(n_embd/n_head, n_head, n_past + N).permute(0, 2, 1, 3)
             struct ggml_tensor * K =
-                ggml_permute(ctx, Kall,
-                        /*ggml_reshape_3d(ctx,
-                            ggml_view_1d(ctx, kv_self.k,
+                ggml_permute(ctx0, Kall,
+                        /*ggml_reshape_3d(ctx0,
+                            ggml_view_1d(ctx0, kv_self.k,
                                 (n_past + N) * n_embd,
                                 ggml_element_size(kv_self.k) * i * n_ctx * n_embd),
                             head_dim, n_head, n_past + N),*/
@@ -1250,17 +1278,17 @@ static bool gptneox_eval_internal(
             // Will use internally ggml_compute_forward_mul_mat_f16_f32 because K is f16 (cache) and Q is f32 (from q4_0)
             // Outputs [N, N, H, B], so it seems like this is correct for "scores"
             // K is internally transposed by ggml_mul_mat
-            struct ggml_tensor * KQ = ggml_mul_mat(ctx, K, Q);
+            struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
             // KQ_scaled = KQ / sqrt(n_embd/n_head)
-            struct ggml_tensor * KQ_scaled = ggml_scale_inplace(ctx, KQ,
-                                                ggml_new_f32(ctx, 1.0f/sqrt(float(head_dim))));
+            struct ggml_tensor * KQ_scaled = ggml_scale_inplace(ctx0, KQ,
+                                                ggml_new_f32(ctx0, 1.0f/sqrt(float(head_dim))));
             // KQ_masked = mask_past(KQ_scaled)
-            struct ggml_tensor * KQ_masked = ggml_diag_mask_inf_inplace(ctx, KQ_scaled, n_past);
+            struct ggml_tensor * KQ_masked = ggml_diag_mask_inf_inplace(ctx0, KQ_scaled, n_past);
             // KQ = soft_max(KQ_masked)
-            struct ggml_tensor * KQ_soft_max = ggml_soft_max_inplace(ctx, KQ_masked);
+            struct ggml_tensor * KQ_soft_max = ggml_soft_max_inplace(ctx0, KQ_masked);
             
             // V_trans = Vmem.view(n_embd/n_head, n_head, n_past + N).permute(1, 2, 0, 3).contiguous()
-            struct ggml_tensor * V_trans = ggml_view_3d(ctx, kv_self.v,
+            struct ggml_tensor * V_trans = ggml_view_3d(ctx0, kv_self.v,
                                                 n_past + N,
                                                 head_dim,
                                                 n_head,
@@ -1269,104 +1297,171 @@ static bool gptneox_eval_internal(
                                                 ggml_element_size(kv_self.v) * i * n_ctx * n_embd);
 
             // KQV = transpose(V) * KQ_soft_max
-            struct ggml_tensor * KQV = ggml_mul_mat(ctx, V_trans, KQ_soft_max);
+            struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V_trans, KQ_soft_max);
 
             // KQV_merged = KQV.permute(0, 2, 1, 3)
-            struct ggml_tensor * KQV_merged = ggml_permute(ctx, KQV, 0, 2, 1, 3);
+            struct ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
 
             // cur = KQV_merged.contiguous().view(n_embd, N)
-            cur = ggml_cpy(ctx, KQV_merged,
-                        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, N));
+            cur = ggml_cpy(ctx0, KQV_merged,
+                        ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, N));
 
             // projection (first weight)
-            cur = ggml_mul_mat(ctx, layer.c_attn_proj_w, cur);
+            cur = ggml_mul_mat(ctx0, layer.c_attn_proj_w, cur);
 
             // projection (then bias)
-            cur = ggml_add_inplace(ctx, cur, ggml_repeat(ctx, layer.c_attn_proj_b, cur));
+            cur = ggml_add_inplace(ctx0, cur, ggml_repeat(ctx0, layer.c_attn_proj_b, cur));
         }
 
-        lctx.use_buf(ctx, 1);
+        lctx.use_buf(ctx0, 1);
         
         if (hparams.use_parallel_residual == 1) {
             //printf("use_parallel_residual == 1\n");
             // This is independent of the self-attention result, so it could be done in parallel to the self-attention
             struct ggml_tensor * outAttn = cur;
             // post attention layer norm
-            cur = layer_norm(ctx, inpL, layer.ln_ff_g, layer.ln_ff_b);
+            cur = layer_norm(ctx0, inpL, layer.ln_ff_g, layer.ln_ff_b);
             // feed-forward network
             {
                 // note here we pass inpFF instead of cur
-                cur = ggml_mul_mat(ctx, layer.c_mlp_fc_w, cur);
-                cur = ggml_add_inplace(ctx,
+                cur = ggml_mul_mat(ctx0, layer.c_mlp_fc_w, cur);
+                cur = ggml_add_inplace(ctx0,
                             cur,
-                            ggml_repeat(ctx, layer.c_mlp_fc_b, cur));
+                            ggml_repeat(ctx0, layer.c_mlp_fc_b, cur));
                 // GELU activation
-                cur = ggml_gelu(ctx, cur);
+                cur = ggml_gelu(ctx0, cur);
                 // projection
                 // cur = proj_w*inpFF + proj_b
-                cur = ggml_mul_mat(ctx, layer.c_mlp_proj_w, cur);
-                cur = ggml_add_inplace(ctx,
+                cur = ggml_mul_mat(ctx0, layer.c_mlp_proj_w, cur);
+                cur = ggml_add_inplace(ctx0,
                             cur,
-                            ggml_repeat(ctx, layer.c_mlp_proj_b, cur));
+                            ggml_repeat(ctx0, layer.c_mlp_proj_b, cur));
             }
             //# pseudocode:
             //# x = x + attn(ln1(x)) + mlp(ln2(x))
             // inpL = inpL + outAttn + cur
-            cur = ggml_add_inplace(ctx, cur, outAttn);
-            inpL = ggml_add_inplace(ctx, inpL, cur);
+            cur = ggml_add_inplace(ctx0, cur, outAttn);
+            inpL = ggml_add_inplace(ctx0, inpL, cur);
         } else if (hparams.use_parallel_residual == 0) {
             //printf("use_parallel_residual == 0\n");
             // This takes the self-attention residual output as input to Feedforward
             struct ggml_tensor * outAttn = cur;
-            inpL = ggml_add(ctx, inpL, outAttn);
+            inpL = ggml_add(ctx0, inpL, outAttn);
             // post attention layer norm
-            cur = layer_norm(ctx, inpL, layer.ln_ff_g, layer.ln_ff_b);
+            cur = layer_norm(ctx0, inpL, layer.ln_ff_g, layer.ln_ff_b);
             // feed-forward network
             {
                 // note here we pass inpFF instead of cur
-                cur = ggml_mul_mat(ctx, layer.c_mlp_fc_w, cur);
-                cur = ggml_add_inplace(ctx,
+                cur = ggml_mul_mat(ctx0, layer.c_mlp_fc_w, cur);
+                cur = ggml_add_inplace(ctx0,
                                cur,
-                               ggml_repeat(ctx, layer.c_mlp_fc_b, cur));
+                               ggml_repeat(ctx0, layer.c_mlp_fc_b, cur));
                 // GELU activation
-                cur = ggml_gelu(ctx, cur);
+                cur = ggml_gelu(ctx0, cur);
                 // projection
                 // cur = proj_w*inpFF + proj_b
-                cur = ggml_mul_mat(ctx, layer.c_mlp_proj_w, cur);
-                cur = ggml_add_inplace(ctx,
+                cur = ggml_mul_mat(ctx0, layer.c_mlp_proj_w, cur);
+                cur = ggml_add_inplace(ctx0,
                                cur,
-                               ggml_repeat(ctx, layer.c_mlp_proj_b, cur));
+                               ggml_repeat(ctx0, layer.c_mlp_proj_b, cur));
             }
             //# pseudocode:
             //# x = x + attn(ln1(x)) (residual above as input to mlp)
             //# x = x + mlp(ln2(x)) (residual after mlp aka inpFF + cur)
-            inpL = ggml_add_inplace(ctx, inpL, cur);
+            inpL = ggml_add_inplace(ctx0, inpL, cur);
         } else {
             printf("use_parallel_residual == %d\n", hparams.use_parallel_residual);
             assert(0);
         }
     }
 
-    lctx.use_buf(ctx, 0);
-
-    // used at the end to optionally extract the embeddings
-    struct ggml_tensor * embeddings = NULL;
+    lctx.use_buf(ctx0, 0);
 
     // norm
-    inpL = layer_norm(ctx, inpL, model.ln_f_g, model.ln_f_b);
-    embeddings = inpL;
+    inpL = layer_norm(ctx0, inpL, model.ln_f_g, model.ln_f_b);
+    ggml_set_name(inpL, "result_norm");
 
     // lm_head
-    inpL = ggml_mul_mat(ctx, model.lmh_g, inpL);
+    inpL = ggml_mul_mat(ctx0, model.lmh_g, inpL);
+    ggml_set_name(inpL, "result_output");
 
-    lctx.use_buf(ctx, -1);
+    lctx.use_buf(ctx0, -1);
 
     // logits -> probs
     //inpL = ggml_soft_max(ctx0, inpL);
 
     // run the computation
-    ggml_build_forward_expand(&gf, inpL);
-    ggml_graph_compute(ctx, &gf);
+    ggml_build_forward_expand(gf, inpL);
+
+    if (mem_per_token == 0) {
+        mem_per_token = ggml_used_mem(ctx0)/N;
+    }
+
+#if 0
+    printf("\n%s: used_mem = %.3f MB, scratch -- %.3f MB %.3f MB\n", __func__,
+            ggml_used_mem(ctx0)/1024.0/1024.0,
+            lctx.get_buf_max_mem(0)/1024.0/1024.0,
+            lctx.get_buf_max_mem(1)/1024.0/1024.0);
+#endif
+
+    ggml_free(ctx0);
+
+    return gf;
+}
+
+// evaluate the transformer
+//
+//   - lctx:      llama context
+//   - tokens:    new batch of tokens to process
+//   - embd       embeddings input
+//   - n_tokens   number of tokens
+//   - n_past:    the context size so far
+//   - n_threads: number of threads to use
+//
+static bool gptneox_eval_internal(
+        gptneox_context & lctx,
+    const gptneox_token * tokens,
+            const float * embd,
+                    int   n_tokens,
+                    int   n_past,
+                    int   n_threads) {
+
+    ARCH_ASSERT((!tokens && embd) || (tokens && !embd));
+
+    const int64_t t_start_us = ggml_time_us();
+
+    const int N = n_tokens;
+
+    const auto & model   = lctx.model;
+    const auto & hparams = model.hparams;
+
+    const auto & kv_self = lctx.kv_self;
+
+    ARCH_ASSERT(!!kv_self.ctx);
+
+    const int64_t n_embd      = hparams.n_embd;
+    const int64_t n_vocab     = hparams.n_vocab;
+
+    ggml_cgraph * gf = gptneox_build_graph(lctx, tokens, embd, n_tokens, n_past);
+
+    // for big prompts, if BLAS is enabled, it is better to use only one thread
+    // otherwise, the threads are spin-lock waiting for the BLAS calls and are degrading the performance
+    n_threads = N >= 32 && ggml_cpu_has_blas() && !ggml_cpu_has_cublas() ? 1 : n_threads;
+
+    struct ggml_tensor * res = gf->nodes[gf->n_nodes - 1];
+    struct ggml_tensor * embeddings = gf->nodes[gf->n_nodes - 2];
+
+    ARCH_ASSERT(strcmp(res->name, "result_output") == 0);
+    ARCH_ASSERT(strcmp(embeddings->name, "result_norm") == 0);
+
+    ggml_graph_compute_helper(lctx.work_buffer, gf, n_threads);
+
+    // update kv token count
+    lctx.kv_self.n = n_past + N;
+
+    //if (cgraph_fname) {
+    //    ggml_graph_export(gf, cgraph_fname);
+    //}
 
 #ifdef GGML_PERF
     // print timing information per ggml operation (for debugging purposes)
@@ -1379,20 +1474,17 @@ static bool gptneox_eval_internal(
     //    ggml_graph_dump_dot(&gf, NULL, "llama.dot");
     //}
 
-    //embd_w.resize(n_vocab*N);
-    //memcpy(embd_w.data(), ggml_get_data(inpL), sizeof(float)*n_vocab*N);
-
     // extract logits
     {
         auto & logits_out = lctx.logits;
 
         if (lctx.logits_all) {
             logits_out.resize(n_vocab * N);
-            memcpy(logits_out.data(), (float *) ggml_get_data(inpL), sizeof(float)*n_vocab*N);
+            memcpy(logits_out.data(), (float *) ggml_get_data(res), sizeof(float)*n_vocab*N);
         } else {
             // return result for just the last token
             logits_out.resize(n_vocab);
-            memcpy(logits_out.data(), (float *) ggml_get_data(inpL) + (n_vocab*(N-1)), sizeof(float)*n_vocab);
+            memcpy(logits_out.data(), (float *) ggml_get_data(res) + (n_vocab*(N-1)), sizeof(float)*n_vocab);
         }
     }
 
@@ -1403,19 +1495,6 @@ static bool gptneox_eval_internal(
         embedding_out.resize(n_embd);
         memcpy(embedding_out.data(), (float *) ggml_get_data(embeddings) + (n_embd*(N - 1)), sizeof(float)*n_embd);
     }
-
-    if (mem_per_token == 0) {
-        mem_per_token = ggml_used_mem(ctx)/N;
-    }
-
-#if 0
-    printf("\n%s: used_mem = %.3f MiB, scratch -- %.3f MiB %.3f MiB\n", __func__,
-            ggml_used_mem(ctx0)/1024.0/1024.0,
-            lctx.get_buf_max_mem(0)/1024.0/1024.0,
-            lctx.get_buf_max_mem(1)/1024.0/1024.0);
-#endif
-
-    ggml_free(ctx);
 
     // measure the performance only for the single-token evals
     if (N == 1) {
@@ -2010,9 +2089,8 @@ struct gptneox_context * gptneox_init_from_file(
             unsigned * cur_percentage_p = (unsigned *) ctx;
             unsigned percentage = (unsigned) (100 * progress);
             while (percentage > *cur_percentage_p) {
-                ++*cur_percentage_p;
+                *cur_percentage_p = percentage;
                 fprintf(stderr, ".");
-                fflush(stderr);
                 if (percentage >= 100) {
                     fprintf(stderr, "\n");
                 }
@@ -2035,15 +2113,15 @@ struct gptneox_context * gptneox_init_from_file(
 
     // reserve memory for context buffers
     if (!params.vocab_only) {
-        if (!kv_cache_init(ctx->model.hparams, ctx->model.kv_self, memory_type, ctx->model.hparams.n_ctx)) {
+        if (!kv_cache_init(ctx->model.hparams, ctx->kv_self, memory_type, ctx->model.hparams.n_ctx)) {
             fprintf(stderr, "%s: kv_cache_init() failed for self-attention cache\n", __func__);
             gptneox_free(ctx);
             return nullptr;
         }
 
         {
-            const size_t memory_size = ggml_nbytes(ctx->model.kv_self.k) + ggml_nbytes(ctx->model.kv_self.v);
-            fprintf(stderr, "%s: kv self size  = %7.2f MiB\n", __func__, memory_size / 1024.0 / 1024.0);
+            const size_t memory_size = ggml_nbytes(ctx->kv_self.k) + ggml_nbytes(ctx->kv_self.v);
+            fprintf(stderr, "%s: kv self size  = %7.2f MB\n", __func__, memory_size / 1024.0 / 1024.0);
         }
 
         const auto & hparams = ctx->model.hparams;
@@ -2135,7 +2213,7 @@ int gptneox_apply_lora_from_file_internal(struct gptneox_context * ctx, const ch
     arch_util_buffer base_buf;
     if (path_base_model) {
         fprintf(stderr, "%s: loading base model from '%s'\n", __func__, path_base_model);
-        model_loader.reset(new gptneox_model_loader(path_base_model, /*use_mmap*/ true, /*vocab_only*/ false));
+        model_loader.reset(new gptneox_model_loader(path_base_model, /*use_mmap*/ true));
 
         size_t ctx_size, mmapped_size;
         model_loader->calc_sizes(&ctx_size, &mmapped_size);
@@ -2159,6 +2237,9 @@ int gptneox_apply_lora_from_file_internal(struct gptneox_context * ctx, const ch
     // read tensors and apply
     bool warned = false;
     int n_tensors = 0;
+
+    std::vector<uint8_t> work_buffer;
+
     while (true) {
         int32_t n_dims;
         int32_t length;
@@ -2285,8 +2366,8 @@ int gptneox_apply_lora_from_file_internal(struct gptneox_context * ctx, const ch
             }
 
             struct ggml_cgraph gf = ggml_build_forward(r);
-            gf.n_threads = n_threads;
-            ggml_graph_compute(lora_ctx, &gf);
+
+            ggml_graph_compute_helper(work_buffer, &gf, n_threads);
 
             // we won't need these tensors again, reset the context to save memory
             ggml_free(lora_ctx);
@@ -2321,13 +2402,13 @@ int gptneox_apply_lora_from_file(struct gptneox_context * ctx, const char * path
 }
 
 int gptneox_get_kv_cache_token_count(struct gptneox_context * ctx) {
-    return ctx->model.kv_self.n;
+    return ctx->kv_self.n;
 }
 
 // Assumes contiguous data
 void gptneox_shift_kv_cache(struct gptneox_context * ctx, int n) {
     auto & model = ctx->model;
-    auto & kv_self = model.kv_self;
+    auto & kv_self = ctx->kv_self;
     auto & hparams = model.hparams;
     const int n_layer = hparams.n_layer;
     const int n_embd = hparams.n_embd;
@@ -2375,7 +2456,7 @@ size_t gptneox_get_state_size(struct gptneox_context * ctx) {
     const size_t s_embedding       = ctx->embedding.size() * sizeof(float);
     const size_t s_kv_size         = sizeof(size_t);
     const size_t s_kv_ntok         = sizeof(int);
-    const size_t s_kv              = ctx->model.kv_self.buf.size;
+    const size_t s_kv              = ctx->kv_self.buf.size;
 
     const size_t s_total = (
         + s_rng_size
@@ -2441,14 +2522,14 @@ size_t gptneox_copy_state_data(struct gptneox_context * ctx, uint8_t * dest) {
 
     // copy kv cache
     {
-        const size_t kv_size = ctx->model.kv_self.buf.size;
+        const size_t kv_size = ctx->kv_self.buf.size;
         const int    kv_ntok = gptneox_get_kv_cache_token_count(ctx);
 
         memcpy(out, &kv_size, sizeof(kv_size)); out += sizeof(kv_size);
         memcpy(out, &kv_ntok, sizeof(kv_ntok)); out += sizeof(kv_ntok);
 
         if (kv_size) {
-            memcpy(out, ctx->model.kv_self.buf.addr, kv_size); out += kv_size;
+            memcpy(out, ctx->kv_self.buf.addr, kv_size); out += kv_size;
         }
     }
 
@@ -2520,19 +2601,19 @@ size_t gptneox_set_state_data(struct gptneox_context * ctx, const uint8_t * src)
         memcpy(&kv_ntok, in, sizeof(kv_ntok)); in += sizeof(kv_ntok);
 
         if (kv_size) {
-            ARCH_ASSERT(ctx->model.kv_self.buf.size == kv_size);
+            ARCH_ASSERT(ctx->kv_self.buf.size == kv_size);
 
-            void * k_data = ctx->model.kv_self.k->data; // remember data pointers
-            void * v_data = ctx->model.kv_self.v->data; // because their value is stored in buf and overwritten by memcpy
+            void * k_data = ctx->kv_self.k->data; // remember data pointers
+            void * v_data = ctx->kv_self.v->data; // because their value is stored in buf and overwritten by memcpy
 
-            memcpy(ctx->model.kv_self.buf.addr, in, kv_size); in += kv_size;
+            memcpy(ctx->kv_self.buf.addr, in, kv_size); in += kv_size;
 
-            ctx->model.kv_self.k->data = k_data; // restore correct data pointers
-            ctx->model.kv_self.v->data = v_data;
+            ctx->kv_self.k->data = k_data; // restore correct data pointers
+            ctx->kv_self.v->data = v_data;
 
         }
 
-        ctx->model.kv_self.n = kv_ntok;
+        ctx->kv_self.n = kv_ntok;
     }
 
     const size_t nread    = in - src;
@@ -2549,7 +2630,7 @@ int gptneox_eval(
                          int   n_tokens,
                          int   n_past,
                          int   n_threads) {
-    if (!gptneox_eval_internal(*ctx, tokens, n_tokens, n_past, n_threads)) {
+    if (!gptneox_eval_internal(*ctx, tokens, nullptr, n_tokens, n_past, n_threads)) {
         fprintf(stderr, "%s: failed to eval\n", __func__);
         return 1;
     }
