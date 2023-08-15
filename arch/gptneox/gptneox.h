@@ -19,6 +19,14 @@
 #    define GPTNEOX_API
 #endif
 
+#ifdef __GNUC__
+#    define DEPRECATED(func, hint) func __attribute__((deprecated(hint)))
+#elif defined(_MSC_VER)
+#    define DEPRECATED(func, hint) __declspec(deprecated(hint)) func
+#else
+#    define DEPRECATED(func, hint) func
+#endif
+
 #define GPTNEOX_FILE_VERSION 1
 #define GPTNEOX_FILE_MAGIC 0x67676a74 // 'ggjt' in hex
 #define GPTNEOX_FILE_MAGIC_UNVERSIONED 0x67676d6c // pre-versioned files
@@ -35,6 +43,7 @@ extern "C" {
     // TODO: show sample usage
     //
 
+    struct gptneox_model;
     struct gptneox_context;
 
     typedef int gptneox_token;
@@ -90,12 +99,23 @@ extern "C" {
     GPTNEOX_API bool gptneox_mmap_supported();
     GPTNEOX_API bool gptneox_mlock_supported();
 
+    GPTNEOX_API struct gptneox_model * gptneox_load_model_from_file(
+                             const char * path_model,
+            struct gptneox_context_params   params);
+
+    GPTNEOX_API void gptneox_free_model(struct gptneox_model * model);
+
+    GPTNEOX_API struct gptneox_context * gptneox_new_context_with_model(
+                     struct gptneox_model * model,
+            struct gptneox_context_params   params);
+
     // Various functions for loading a ggml llama model.
     // Allocate (almost) all memory needed for the model.
     // Return NULL on failure
-    GPTNEOX_API struct gptneox_context * gptneox_init_from_file(
+    GPTNEOX_API DEPRECATED(struct gptneox_context * gptneox_init_from_file(
                              const char * path_model,
-            struct gptneox_context_params   params);
+            struct gptneox_context_params   params),
+            "please use gptneox_load_model_from_file combined with gptneox_new_context_with_model instead");
 
     // Frees all allocated memory
     GPTNEOX_API void gptneox_free(struct gptneox_context * ctx);
@@ -119,8 +139,15 @@ extern "C" {
     // The model needs to be reloaded before applying a new adapter, otherwise the adapter
     // will be applied on top of the previous one
     // Returns 0 on success
-    GPTNEOX_API int gptneox_apply_lora_from_file(
+    GPTNEOX_API DEPRECATED(int gptneox_apply_lora_from_file(
             struct gptneox_context * ctx,
+                      const char * path_lora,
+                      const char * path_base_model,
+                             int   n_threads),
+            "please use gptneox_model_apply_lora_from_file instead");
+
+    GPTNEOX_API int gptneox_model_apply_lora_from_file(
+            const struct gptneox_model * model,
                       const char * path_lora,
                       const char * path_base_model,
                              int   n_threads);

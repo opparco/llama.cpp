@@ -921,7 +921,6 @@ static const char *gptneox_model_type_name(e_model type) {
 
 static void gptneox_model_load_internal(
         const std::string & fname,
-        //OBSOLETE: gptneox_context & lctx,
         gptneox_model & model,
         gptneox_vocab & vocab,
         int n_ctx,
@@ -1085,7 +1084,6 @@ static void gptneox_model_load_internal(
 
 static bool gptneox_model_load(
         const std::string & fname,
-        //OBSOLETE: gptneox_context & lctx,
         gptneox_model & model,
         gptneox_vocab & vocab,
         int n_ctx,
@@ -2203,10 +2201,8 @@ void gptneox_free(struct gptneox_context * ctx) {
     delete ctx;
 }
 
-int gptneox_apply_lora_from_file_internal(struct gptneox_context * ctx, const char * path_lora, const char * path_base_model, int n_threads) {
+int gptneox_apply_lora_from_file_internal(const struct gptneox_model & model, const char * path_lora, const char * path_base_model, int n_threads) {
     fprintf(stderr, "%s: applying lora adapter from '%s' - please wait ...\n", __func__, path_lora);
-
-    auto & model = ctx->model;
 
     const int64_t t_start_lora_us = ggml_time_us();
 
@@ -2447,9 +2443,18 @@ int gptneox_apply_lora_from_file_internal(struct gptneox_context * ctx, const ch
 
 int gptneox_apply_lora_from_file(struct gptneox_context * ctx, const char * path_lora, const char * path_base_model, int n_threads) {
     try {
-        return gptneox_apply_lora_from_file_internal(ctx, path_lora, path_base_model, n_threads);
-    } catch (const std::string & err) {
-        fprintf(stderr, "%s: failed to apply lora adapter: %s\n", __func__, err.c_str());
+        return gptneox_apply_lora_from_file_internal(ctx->model, path_lora, path_base_model, n_threads);
+    } catch (const std::exception & err) {
+        fprintf(stderr, "%s: failed to apply lora adapter: %s\n", __func__, err.what());
+        return 1;
+    }
+}
+
+int gptneox_model_apply_lora_from_file(const struct gptneox_model * model, const char * path_lora, const char * path_base_model, int n_threads) {
+    try {
+        return gptneox_apply_lora_from_file_internal(*model, path_lora, path_base_model, n_threads);
+    } catch (const std::exception & err) {
+        fprintf(stderr, "%s: failed to apply lora adapter: %s\n", __func__, err.what());
         return 1;
     }
 }
