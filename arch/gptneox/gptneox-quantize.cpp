@@ -78,7 +78,7 @@ static void gptneox_model_quantize_internal(const std::string & fname_inp, const
     }
 
     std::unique_ptr<gptneox_model_loader> model_loader(new gptneox_model_loader(fname_inp, /*use_mmap*/ false));
-    arch_util_file_saver file_saver(fname_out.c_str(), model_loader->file_loaders.at(0).get(), ftype);
+    arch_util_file_saver file_saver(fname_out.c_str(), model_loader->file_loader.get(), ftype);
 
     size_t total_size_org = 0;
     size_t total_size_new = 0;

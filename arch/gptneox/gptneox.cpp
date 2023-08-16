@@ -351,96 +351,14 @@ static size_t gptneox_calc_tensor_size(const std::vector<uint32_t> & ne, enum gg
     return size / ggml_blck_size(type);
 }
 
-struct gptneox_load_tensor_shard {
-    std::vector<uint32_t> ne;
-    size_t size;
-    enum ggml_type type;
-    size_t file_idx;
-    size_t file_off;
-
-    void calc_size() {
-        size = gptneox_calc_tensor_size(ne, type);
-    }
-};
-
-enum gptneox_split_type {
-    SPLIT_NONE,
-    SPLIT_BY_COLUMNS,
-    SPLIT_BY_ROWS
-};
-
 struct gptneox_load_tensor {
-    std::vector<gptneox_load_tensor_shard> shards;
-
     std::string name;
     enum ggml_type type = GGML_TYPE_F32;
-    gptneox_split_type split_type = SPLIT_NONE;
     std::vector<uint32_t> ne;
+    size_t file_off;
     size_t size;
     struct ggml_tensor * ggml_tensor = NULL;
     uint8_t * data;
-
-    gptneox_load_tensor(const std::string & name) : name(name) {}
-
-    void calc_all() {
-        calc_type();
-        calc_split_type();
-        calc_ne();
-        calc_size();
-    }
-
-    void calc_type() {
-        const auto & first_shard = shards.at(0);
-        for (const auto & shard : shards) {
-            if (shard.type != first_shard.type) {
-                throw format("inconsistent tensor shard type in '%s'", name.c_str());
-            }
-        }
-        type = first_shard.type;
-    }
-
-    void calc_split_type() {
-        if (shards.at(0).ne.size() == 1 || // 1D tensors are just duplicated in every file
-            shards.size() == 1) { // only one file?
-            split_type = SPLIT_NONE;
-        } else if (name.find("gpt_neox.embed_in.") == 0 ||
-            name.find(".attention.wo.weight") != std::string::npos ||
-            name.find(".feed_forward.w2.weight") != std::string::npos) {
-            split_type = SPLIT_BY_COLUMNS;
-        } else {
-            split_type = SPLIT_BY_ROWS;
-        }
-    }
-
-    void calc_ne() {
-        const auto & first_shard = shards.at(0);
-        for (const auto & shard : shards) {
-            if (shard.ne != first_shard.ne) {
-                throw format("inconsistent tensor shard shape in '%s': first was %s, other was %s",
-                             name.c_str(), gptneox_format_tensor_shape(first_shard.ne).c_str(), gptneox_format_tensor_shape(shard.ne).c_str());
-            }
-        }
-        ne = first_shard.ne;
-        ARCH_ASSERT(shards.size() <= UINT32_MAX);
-        uint32_t n_shards = (uint32_t) shards.size();
-        switch (split_type) {
-            case SPLIT_NONE:
-                ne = first_shard.ne;
-                break;
-            case SPLIT_BY_COLUMNS:
-                ne = {checked_mul<uint32_t>(first_shard.ne[0], n_shards),
-                      first_shard.ne[1]};
-                break;
-            case SPLIT_BY_ROWS:
-                ne = {first_shard.ne[0],
-                      checked_mul<uint32_t>(first_shard.ne[1], n_shards)};
-                break;
-        }
-    }
-
-    void calc_size() {
-        size = gptneox_calc_tensor_size(ne, type);
-    }
 };
 
 struct gptneox_load_tensors_map {
@@ -461,13 +379,13 @@ struct arch_util_file_loader {
     gptneox_hparams hparams;
     gptneox_vocab vocab;
 
-    arch_util_file_loader(const char * fname, size_t file_idx, gptneox_load_tensors_map & tensors_map)
+    arch_util_file_loader(const char * fname, gptneox_load_tensors_map & tensors_map)
         : file(fname, "rb") {
         fprintf(stderr, "gptneox.cpp: loading model from %s\n", fname);
         read_magic();
         read_hparams();
         read_vocab();
-        read_tensor_metadata(file_idx, tensors_map);
+        read_tensor_metadata(tensors_map);
     }
     void read_magic() {
         uint32_t magic = file.read_u32();
@@ -517,19 +435,19 @@ struct arch_util_file_loader {
             tok_score.score = score;
         }
     }
-    void read_tensor_metadata(size_t file_idx, gptneox_load_tensors_map & tensors_map) {
+    void read_tensor_metadata(gptneox_load_tensors_map & tensors_map) {
         while (file.tell() < file.size) {
-            gptneox_load_tensor_shard shard;
+            gptneox_load_tensor tensor;
             uint32_t n_dims = file.read_u32();
             uint32_t name_len = file.read_u32();
-            shard.type = (enum ggml_type) file.read_u32();
-            shard.ne.resize(n_dims);
-            file.read_raw(shard.ne.data(), sizeof(shard.ne[0]) * n_dims);
+            tensor.type = (enum ggml_type) file.read_u32();
+            tensor.ne.resize(n_dims);
+            file.read_raw(tensor.ne.data(), sizeof(tensor.ne[0]) * n_dims);
             std::string name = file.read_string(name_len);
             if (n_dims < 1 || n_dims > 2) {
                 throw format("gptneox.cpp: tensor '%s' should not be %u-dimensional", name.c_str(), n_dims);
             }
-            switch (shard.type) {
+            switch (tensor.type) {
                 case GGML_TYPE_F32:
                 case GGML_TYPE_F16:
                 case GGML_TYPE_Q4_0:
@@ -539,30 +457,22 @@ struct arch_util_file_loader {
                 case GGML_TYPE_Q8_0:
                     break;
                 default: {
-                    throw format("unrecognized tensor type %u\n", shard.type);
+                    throw format("unrecognized tensor type %u\n", tensor.type);
                 }
             }
 
+            // skip to the next multiple of 32 bytes
             if (file_version >= GPTNEOX_FILE_VERSION_GGJT_V1) {
-                // skip to the next multiple of 32 bytes
                 file.seek(-static_cast<ptrdiff_t>(file.tell()) & 31, SEEK_CUR);
             }
-            shard.file_idx = file_idx;
-            shard.file_off = file.tell();
 
-            shard.calc_size();
-            file.seek(shard.size, SEEK_CUR);
+            tensor.file_off = file.tell();
+            tensor.name = name;
+            tensor.size = gptneox_calc_tensor_size(tensor.ne, tensor.type);
+            file.seek(tensor.size, SEEK_CUR);
 
-            auto it = tensors_map.name_to_idx.find(name);
-            size_t idx;
-            if (it != tensors_map.name_to_idx.end()) {
-                idx = it->second;
-            } else {
-                tensors_map.tensors.emplace_back(name);
-                idx = tensors_map.tensors.size() - 1;
-                tensors_map.name_to_idx.emplace(name, idx);
-            }
-            tensors_map.tensors.at(idx).shards.push_back(shard);
+            tensors_map.tensors.push_back(tensor);
+            tensors_map.name_to_idx[name] = tensors_map.tensors.size() - 1;
         }
     }
 };
@@ -628,7 +538,7 @@ struct arch_util_file_saver {
 };
 
 struct gptneox_model_loader {
-    std::vector<std::unique_ptr<arch_util_file_loader>> file_loaders;
+    std::unique_ptr<arch_util_file_loader> file_loader;
     gptneox_load_tensors_map tensors_map;
     bool use_mmap;
     size_t num_ggml_tensors_created = 0;
@@ -636,39 +546,11 @@ struct gptneox_model_loader {
     std::unique_ptr<arch_util_mmap> mapping;
 
     gptneox_model_loader(const std::string & fname_base, bool use_mmap) {
-        auto first_file = new arch_util_file_loader(fname_base.c_str(), 0, tensors_map);
-        file_loaders.emplace_back(first_file);
-        uint32_t n_parts = 1;
-        for (uint32_t i = 1; i < n_parts; i++) {
-            std::string fname = fname_base + "." + std::to_string(i);
-            auto ith_file = new arch_util_file_loader(fname.c_str(), i, tensors_map);
-            file_loaders.emplace_back(ith_file);
-            if (ith_file->hparams != first_file->hparams) {
-                throw format("gptneox.cpp: hparams inconsistent between files");
-            }
-        }
+        file_loader = std::unique_ptr<arch_util_file_loader>(new arch_util_file_loader(fname_base.c_str(), tensors_map));
         if (!arch_util_mmap::SUPPORTED) {
             use_mmap = false;
         }
-        if (use_mmap && alignment_prevents_mmap()) {
-            fprintf(stderr, "gptneox.cpp: can't use mmap because tensors are not aligned; convert to new format to avoid this\n");
-            use_mmap = false;
-        }
         this->use_mmap = use_mmap;
-        for (gptneox_load_tensor & lt : tensors_map.tensors) {
-            lt.calc_all();
-        }
-    }
-
-    bool alignment_prevents_mmap() {
-        for (const gptneox_load_tensor & lt : tensors_map.tensors) {
-            for (const gptneox_load_tensor_shard & shard : lt.shards) {
-                if (shard.file_off & 3) {
-                    return true;
-                }
-            }
-        }
-        return false;
     }
 
     void calc_sizes(size_t * ctx_size_p, size_t * mmapped_size_p) const {
@@ -722,12 +604,13 @@ struct gptneox_model_loader {
 
     void load_all_data(gptneox_progress_callback progress_callback, void *  progress_callback_user_data, arch_util_mlock * lmlock) {
         size_t data_size = 0;
+        size_t lock_size = 0;
         for (const gptneox_load_tensor & lt : tensors_map.tensors) {
             data_size += lt.size;
         }
 
         if (use_mmap) {
-            mapping.reset(new arch_util_mmap(&file_loaders.at(0)->file));
+            mapping.reset(new arch_util_mmap(&file_loader->file));
             if (!lmlock) {
                 // Don't call the callback since the actual loading will be lazy
                 // and we can't measure it.
@@ -745,60 +628,29 @@ struct gptneox_model_loader {
             }
             ARCH_ASSERT(lt.ggml_tensor); // unused tensors should have been caught by load_data already
             lt.data = (uint8_t *) lt.ggml_tensor->data;
+
             load_data_for(lt);
+
+            // case GGML_BACKEND_CPU:
             lt.ggml_tensor->data = lt.data;
-            done_size += lt.size;
             if (use_mmap && lmlock) {
-                lmlock->grow_to(done_size);
+                lock_size += lt.size;
+                lmlock->grow_to(lock_size);
             }
-        }
-        if (progress_callback) {
-            progress_callback(1.0f, progress_callback_user_data);
+
+            done_size += lt.size;
         }
     }
 
     void load_data_for(gptneox_load_tensor & lt) {
         if (use_mmap) {
-            ARCH_ASSERT(lt.shards.size() == 1);
-            lt.data = (uint8_t *) mapping->addr + lt.shards.at(0).file_off;
-        } else if (lt.split_type == SPLIT_NONE) {
-            arch_util_file & file = file_loaders.at(lt.shards.at(0).file_idx)->file;
-            file.seek(lt.shards.at(0).file_off, SEEK_SET);
+            lt.data = (uint8_t *) mapping->addr + lt.file_off;
+        } else {
+            arch_util_file & file = file_loader->file;
+            file.seek(lt.file_off, SEEK_SET);
             file.read_raw(lt.data, lt.size);
-        } else if (lt.split_type == SPLIT_BY_ROWS) {
-            size_t offset = 0;
-            for (gptneox_load_tensor_shard & shard : lt.shards) {
-                arch_util_file & file = file_loaders.at(shard.file_idx)->file;
-                file.seek(shard.file_off, SEEK_SET);
-                file.read_raw(lt.data + offset, shard.size);
-                offset += shard.size;
-            }
-            ARCH_ASSERT(offset == lt.size);
-        } else if (lt.split_type == SPLIT_BY_COLUMNS) {
-            // Let's load the data into temporary buffers to ensure the OS performs large loads.
-            std::vector<arch_util_buffer> tmp_bufs;
-            tmp_bufs.resize(lt.shards.size());
-            for (size_t i = 0; i < lt.shards.size(); i++) {
-                gptneox_load_tensor_shard & shard = lt.shards.at(i);
-                arch_util_file & file = file_loaders.at(shard.file_idx)->file;
-                file.seek(shard.file_off, SEEK_SET);
-                tmp_bufs.at(i).resize(shard.size);
-                file.read_raw(tmp_bufs.at(i).addr, shard.size);
-            }
-            // Then reshape.
-            size_t num_rows = lt.ne.at(1);
-            size_t per_shard_row_size = lt.shards.at(0).size / num_rows;
-            size_t out_offset = 0;
-            for (size_t row = 0; row < num_rows; row++) {
-                for (arch_util_buffer & tmp_buf : tmp_bufs) {
-                    memcpy(lt.data + out_offset,
-                           tmp_buf.addr + row * per_shard_row_size,
-                           per_shard_row_size);
-                    out_offset += per_shard_row_size;
-                }
-            }
-            ARCH_ASSERT(out_offset == lt.size);
         }
+
         if (0) {
             print_checksum(lt);
         }
@@ -935,10 +787,10 @@ static void gptneox_model_load_internal(
 
     std::unique_ptr<gptneox_model_loader> ml(new gptneox_model_loader(fname, use_mmap));
 
-    vocab = std::move(ml->file_loaders.at(0)->vocab);
-    model.hparams = ml->file_loaders.at(0)->hparams;
+    vocab = std::move(ml->file_loader->vocab);
+    model.hparams = ml->file_loader->hparams;
 
-    arch_util_file_version file_version = ml->file_loaders.at(0)->file_version;
+    arch_util_file_version file_version = ml->file_loader->file_version;
 
     auto & hparams = model.hparams;
     
@@ -973,7 +825,6 @@ static void gptneox_model_load_internal(
         fprintf(stderr, "%s: n_rot      = %u\n",  __func__, hparams.n_rot);
         fprintf(stderr, "%s: use_parallel_residual = %d\n", __func__, hparams.use_parallel_residual);
         fprintf(stderr, "%s: ftype      = %u (%s)\n", __func__, hparams.ftype, gptneox_ftype_name(hparams.ftype));
-        fprintf(stderr, "%s: n_parts    = %zu\n", __func__, ml->file_loaders.size());
         fprintf(stderr, "%s: model size = %s\n",  __func__, gptneox_model_type_name(model.type));
     }
 
@@ -2279,7 +2130,7 @@ int gptneox_apply_lora_from_file_internal(const struct gptneox_model & model, co
 
         // maybe this should in gptneox_model_loader
         if (model_loader->use_mmap) {
-            model_loader->mapping.reset(new arch_util_mmap(&model_loader->file_loaders.at(0)->file, /* prefetch */ false));
+            model_loader->mapping.reset(new arch_util_mmap(&model_loader->file_loader->file, /* prefetch */ false));
         }
     }
 
