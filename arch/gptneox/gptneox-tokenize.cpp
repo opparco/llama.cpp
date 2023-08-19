@@ -16,6 +16,8 @@ struct gptneox_sp_symbol {
     size_t n;
 };
 
+static_assert(std::is_trivially_copyable<gptneox_sp_symbol>::value, "gptneox_sp_symbol is not trivially copyable");
+
 struct gptneox_sp_bigram {
     struct comparator {
         bool operator()(gptneox_sp_bigram & l, gptneox_sp_bigram & r) {
@@ -48,7 +50,7 @@ struct gptneox_tokenizer {
             sym.prev = index - 1;
             sym.next = offs == text.size() ? -1 : index + 1;
             index++;
-            symbols_.emplace_back(std::move(sym));
+            symbols_.emplace_back(sym);
         }
 
         // seed the work queue with all possible 2-character tokens.
@@ -94,7 +96,9 @@ struct gptneox_tokenizer {
             if (token == vocab_.token_to_id.end()) {
                 // output any symbols that did not form tokens as bytes.
                 for (int j = 0; j < (int) symbol.n; ++j) {
-                    gptneox_vocab::id token_id = static_cast<uint8_t>(symbol.text[j]) + 3;
+                    // NOTE: old version, before #2420 - not sure what are the implications of this
+                    //gptneox_vocab::id token_id = static_cast<uint8_t>(symbol.text[j]) + 3;
+                    gptneox_vocab::id token_id = vocab_.token_to_id.at(std::string(1, symbol.text[j]));
                     output.push_back(token_id);
                 }
             } else {
@@ -139,7 +143,7 @@ static std::vector<gptneox_vocab::id> gptneox_tokenize(const gptneox_vocab & voc
     gptneox_tokenizer tokenizer(vocab);
     std::vector<gptneox_vocab::id> output;
 
-    if (text.size() == 0) {
+    if (text.empty()) {
         return output;
     }
 
